@@ -1,0 +1,313 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // Neon: the app talks to the pooled endpoint, while `prisma migrate` needs the
+  // unpooled one because it takes an advisory lock.
+  directUrl = env("DIRECT_URL")
+}
+
+enum UserRole {
+  OWNER
+  AGENT
+  ADMIN
+  VIEWER
+}
+
+enum ProviderKind {
+  GROQ
+  GEMINI
+  OPENROUTER
+  OLLAMA
+  DEMO
+  AUTOAPP
+}
+
+enum SourceType {
+  TEXT
+  PDF
+  DOCX
+  MARKDOWN
+}
+
+enum SourceStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+  DELETED
+}
+
+enum ConversationChannel {
+  WEB
+  WHATSAPP
+  EMAIL
+  TELEGRAM
+}
+
+enum ConversationStatus {
+  BOT
+  HANDOFF
+  HUMAN
+  RESOLVED
+  FAILED
+}
+
+enum MessageRole {
+  CUSTOMER
+  ASSISTANT
+  AGENT
+  SYSTEM
+}
+
+enum MessageStatus {
+  PENDING
+  STREAMING
+  SENT
+  DELIVERED
+  FAILED
+}
+
+model Tenant {
+  id              String                 @id @default(cuid())
+  name            String
+  widgetKey       String                 @unique @default(cuid())
+  allowedOrigins  String[]               @default([])
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+  settings        TenantSettings?
+  users           User[]
+  refreshTokens   RefreshToken[]
+  apiKeys         ApiKey[]
+  providerConfigs TenantProviderConfig[]
+  sources         KnowledgeSource[]
+  chunks          KnowledgeChunk[]
+  customers       Customer[]
+  conversations   Conversation[]
+  messages        Message[]
+  usage           LlmUsage[]
+  auditLogs       AuditLog[]
+}
+
+model TenantSettings {
+  id                  String   @id @default(cuid())
+  tenantId            String   @unique
+  timezone            String   @default("Asia/Jakarta")
+  language            String   @default("id")
+  brandVoice          String   @default("Ramah, profesional, dan selalu jawab berdasarkan knowledge base.")
+  businessHours       String   @default("09:00-21:00")
+  escalationThreshold Float    @default(0.65)
+  autoReplyEnabled    Boolean  @default(true)
+  streamingEnabled    Boolean  @default(true)
+  citationsEnabled    Boolean  @default(true)
+  emailNotifications  Boolean  @default(true)
+  pushNotifications   Boolean  @default(false)
+  weeklyReports       Boolean  @default(true)
+  autoThrottle        Boolean  @default(true)
+  alertThreshold      Int      @default(80)
+  dailyTokenBudget    Int      @default(1000000)
+  embeddingModel      String   @default("nomic-embed-text-v1.5")
+  embeddingVersion    String   @default("1")
+  tenant              Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+}
+
+model User {
+  id           String   @id @default(cuid())
+  tenantId     String
+  email        String   @unique
+  name         String?
+  passwordHash String?
+  googleId     String?  @unique
+  role         UserRole @default(OWNER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  refreshTokens RefreshToken[]
+  @@index([tenantId, role])
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  tenantId  String
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  @@index([userId, expiresAt])
+}
+
+model ApiKey {
+  id          String   @id @default(cuid())
+  tenantId    String
+  name        String
+  keyPrefix   String
+  keyHash     String   @unique
+  scopes      String[] @default([])
+  lastUsedAt  DateTime?
+  expiresAt   DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime @default(now())
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  @@index([tenantId, revokedAt])
+}
+
+model TenantProviderConfig {
+  id        String       @id @default(cuid())
+  tenantId  String
+  provider  ProviderKind
+  model     String
+  enabled   Boolean      @default(false)
+  priority  Int          @default(100)
+  dailyLimit Int?
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+  tenant    Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  @@unique([tenantId, provider, model])
+  @@index([tenantId, enabled, priority])
+}
+
+model KnowledgeSource {
+  id            String       @id @default(cuid())
+  tenantId      String
+  title         String
+  type          SourceType
+  mimeType      String?
+  filename      String?
+  storagePath   String?
+  content       String?
+  status        SourceStatus @default(PENDING)
+  errorMessage  String?
+  chunkCount    Int          @default(0)
+  byteSize      Int          @default(0)
+  indexedAt     DateTime?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  tenant        Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  chunks        KnowledgeChunk[]
+  @@index([tenantId, status, updatedAt])
+}
+
+model KnowledgeChunk {
+  id        String   @id @default(cuid())
+  tenantId  String
+  sourceId  String
+  ordinal   Int
+  content   String
+  metadata  Json     @default("{}")
+  embedding Unsupported("vector(768)")?
+  createdAt DateTime @default(now())
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  source    KnowledgeSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  @@unique([sourceId, ordinal])
+  @@index([tenantId, sourceId])
+}
+
+model Customer {
+  id          String   @id @default(cuid())
+  tenantId    String
+  name        String?
+  email       String?
+  externalId  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+  @@unique([tenantId, email])
+  @@index([tenantId, externalId])
+}
+
+model Conversation {
+  id            String             @id @default(cuid())
+  tenantId      String
+  customerId    String?
+  channel       ConversationChannel @default(WEB)
+  status        ConversationStatus  @default(BOT)
+  subject       String?
+  lastMessageAt DateTime            @default(now())
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+  tenant        Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer      Customer?           @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  messages      Message[]
+  events        ConversationEvent[]
+  @@index([tenantId, status, lastMessageAt])
+  @@index([tenantId, channel, lastMessageAt])
+}
+
+model Message {
+  id             String        @id @default(cuid())
+  tenantId       String
+  conversationId String
+  authorUserId   String?
+  role           MessageRole
+  status         MessageStatus @default(SENT)
+  content        String
+  provider       String?
+  model          String?
+  confidence     Float?
+  tokensIn       Int?
+  tokensOut      Int?
+  latencyMs      Int?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  tenant         Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversation   Conversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  citations      MessageCitation[]
+  @@index([tenantId, conversationId, createdAt])
+}
+
+model MessageCitation {
+  id        String   @id @default(cuid())
+  messageId String
+  sourceId  String
+  chunkId   String
+  score     Float
+  createdAt DateTime @default(now())
+  message   Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  @@index([messageId])
+}
+
+model ConversationEvent {
+  id             String   @id @default(cuid())
+  conversationId String
+  type           String
+  data           Json     @default("{}")
+  createdAt      DateTime @default(now())
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  @@index([conversationId, createdAt])
+}
+
+model LlmUsage {
+  id           String   @id @default(cuid())
+  tenantId     String
+  provider     String
+  model        String
+  requestType  String
+  tokensIn     Int      @default(0)
+  tokensOut    Int      @default(0)
+  latencyMs    Int?
+  outcome      String
+  createdAt    DateTime @default(now())
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  @@index([tenantId, createdAt])
+  @@index([tenantId, provider, createdAt])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  tenantId   String
+  actorUserId String?
+  action     String
+  entityType String
+  entityId   String?
+  details    Json     @default("{}")
+  createdAt  DateTime @default(now())
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  @@index([tenantId, createdAt])
+}

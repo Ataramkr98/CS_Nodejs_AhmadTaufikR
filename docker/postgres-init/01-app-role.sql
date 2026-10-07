@@ -1,0 +1,9 @@
+-- Prisma migrations execute as csp (the database owner). The running API uses
+-- this unprivileged role, so FORCE ROW LEVEL SECURITY applies to every query.
+CREATE ROLE csp_app LOGIN PASSWORD 'csp_app' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+GRANT CONNECT ON DATABASE csp TO csp_app;
+GRANT USAGE ON SCHEMA public TO csp_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO csp_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT USAGE, SELECT ON SEQUENCES TO csp_app;
