@@ -25,8 +25,11 @@ export class HealthController {
       return {
         status: 'ready',
         database: 'ok',
-        queueMode:
-          this.config.get('QUEUE_ENABLED') === 'true' ? 'bullmq' : 'in-process',
+        queueMode: process.env.VERCEL
+          ? 'request'
+          : this.config.get('QUEUE_ENABLED') === 'true'
+            ? 'bullmq'
+            : 'in-process',
         aiMode: this.config.get('AI_MODE', 'live'),
       };
     } catch {

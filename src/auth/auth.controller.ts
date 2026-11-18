@@ -14,7 +14,7 @@ import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'crypto';
 import type { FastifyReply } from 'fastify';
 import { z } from 'zod';
-import { OperatorGuard } from '../common/security';
+import { OperatorGuard, OptionalOperatorGuard } from '../common/security';
 import type { AuthenticatedRequest } from '../common/security';
 import { parseInput } from '../common/validation';
 import { AuthService } from './auth.service';
@@ -114,11 +114,18 @@ export class AuthController {
    * instead of dropping the user back to the login screen.
    */
   @Get('me')
-  @UseGuards(OperatorGuard)
+  @UseGuards(OptionalOperatorGuard)
   async me(@Req() request: AuthenticatedRequest) {
+    if (!request.user) {
+      return {
+        user: null,
+        tenant: null,
+        canRefresh: Boolean(request.cookies?.csp_refresh),
+      };
+    }
     const session = await this.auth.currentSession(
-      request.user!.tenantId,
-      request.user!.sub,
+      request.user.tenantId,
+      request.user.sub,
     );
     return { user: session.user, tenant: session.tenant };
   }

@@ -23,7 +23,7 @@
       return null;
     })();
 
-  if (!script) return;
+  if (!script || !script.isConnected) return;
   var widgetKey = script.getAttribute('data-csp-key');
   if (!widgetKey) {
     console.warn('[csp] widget.js requires a data-csp-key attribute.');
@@ -31,7 +31,11 @@
   }
 
   var API = new URL(script.src, location.href).origin;
-  var STORAGE_KEY = 'csp:widget:' + widgetKey;
+  var STORAGE_KEY = script.getAttribute('data-csp-storage-key') || 'csp:widget:' + widgetKey;
+  var mountId = script.getAttribute('data-csp-mount');
+  var mount = mountId ? document.getElementById(mountId) : null;
+  if (mount && mount.querySelector('[data-csp-widget]')) return;
+  var inline = Boolean(mount);
   var POLL_INTERVAL_MS = 1500;
   var POLL_MAX_ATTEMPTS = 40;
 
@@ -44,13 +48,35 @@
     pending: false,
     pollAttempts: 0,
     pollTimer: null,
+    pollVersion: 0,
+    replyTo: null,
+    expectAI: false,
+    conversationStatus: 'BOT',
+    error: null,
+    destroyed: false,
   };
+
+  function notify() {
+    if (state.destroyed) return;
+    window.dispatchEvent(new CustomEvent('csp:state', { detail: {
+      widgetKey: widgetKey,
+      mountId: mountId,
+      ready: Boolean(state.config),
+      autoReplyEnabled: Boolean(state.config && state.config.autoReplyEnabled),
+      conversationId: state.conversationId,
+      status: state.conversationStatus,
+      pending: state.pending,
+      messageCount: state.messages.length,
+      replyCount: state.messages.filter(function (message) { return message.role === 'ASSISTANT'; }).length,
+      error: state.error,
+    } }));
+  }
 
   /* ----------------------------------------------------------------- api --- */
 
   function apiFetch(path, options) {
     options = options || {};
-    var headers = { Accept: 'application/json' };
+    var headers = { Accept: 'application/json', 'x-csp-widget-origin': location.origin };
     if (options.body) headers['Content-Type'] = 'application/json';
     if (options.token) headers.Authorization = 'Bearer ' + options.token;
     return fetch(API + path, {
@@ -68,7 +94,7 @@
           if (!response.ok) {
             var detail =
               (payload && (payload.detail || payload.message)) ||
-              'Permintaan gagal (' + response.status + ')';
+              'Request failed (' + response.status + ')';
             throw new Error(detail);
           }
           // Every successful API response is `{ success, message, data }`.
@@ -108,10 +134,15 @@
 
   var host = document.createElement('div');
   host.setAttribute('data-csp-widget', widgetKey);
-  host.style.position = 'fixed';
-  host.style.zIndex = '2147483000';
-  host.style.bottom = '20px';
-  host.style.right = '20px';
+  host.style.position = inline ? 'relative' : 'fixed';
+  host.style.zIndex = inline ? '0' : '2147483000';
+  if (inline) {
+    host.style.display = 'block';
+    host.style.width = '100%';
+  } else {
+    host.style.bottom = '20px';
+    host.style.right = '20px';
+  }
   var shadow = host.attachShadow ? host.attachShadow({ mode: 'open' }) : host;
 
   var style = document.createElement('style');
@@ -128,6 +159,9 @@
     'display:flex;flex-direction:column;background:#fff8f3;color:#1f1b16;border:1px solid #e1d9d1;',
     'border-radius:14px;overflow:hidden;box-shadow:0 24px 48px -16px rgba(31,27,22,.35)}',
     '.panel[hidden]{display:none}',
+    '.launcher[hidden]{display:none}',
+    '.panel.inline{position:relative;right:auto;bottom:auto;width:100%;height:540px;max-height:76dvh;box-shadow:none;border-radius:0;border:0}',
+    '.panel.inline .log:before{content:"";margin-top:auto}',
     '.header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;',
     'background:#5d5f5f;color:#fff}',
     '.header__title{font-size:14px;font-weight:600;margin:0}',
@@ -160,16 +194,17 @@
   var launcher = document.createElement('button');
   launcher.className = 'launcher';
   launcher.type = 'button';
+  launcher.hidden = inline;
   launcher.setAttribute('aria-expanded', 'false');
   launcher.setAttribute('aria-controls', 'csp-panel');
   launcher.innerHTML =
     '<span class="launcher__mark" aria-hidden="true">CS</span><span class="label">Chat</span>';
 
   var panel = document.createElement('section');
-  panel.className = 'panel';
+  panel.className = inline ? 'panel inline' : 'panel';
   panel.id = 'csp-panel';
   panel.hidden = true;
-  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('role', inline ? 'region' : 'dialog');
   panel.setAttribute('aria-label', 'Live chat');
   panel.innerHTML = [
     '<header class="header">',
@@ -193,11 +228,26 @@
   var inputEl = panel.querySelector('[data-role="input"]');
   var statusEl = panel.querySelector('[data-role="status"]');
   var submitEl = formEl.querySelector('button[type="submit"]');
+  if (inline) panel.querySelector('[data-action="close"]').hidden = true;
 
   /* -------------------------------------------------------------- render --- */
 
   function setStatus(text) {
     statusEl.textContent = text;
+  }
+
+  function updateStatus(status) {
+    state.conversationStatus = status || state.conversationStatus;
+    var name = state.config ? state.config.tenantName : '';
+    var label = state.conversationStatus === 'HUMAN' || state.conversationStatus === 'HANDOFF'
+      ? 'Human support requested'
+      : state.conversationStatus === 'FAILED'
+        ? 'AI unavailable · message saved'
+        : state.config && state.config.autoReplyEnabled
+          ? 'AI support · 24/7'
+          : 'Messages for the support team';
+    setStatus(label + (name ? ' · ' + name : ''));
+    notify();
   }
 
   function systemNote(text) {
@@ -213,6 +263,8 @@
   }
 
   function appendMessage(message) {
+    var empty = logEl.querySelector('.empty');
+    if (empty) empty.remove();
     var isCustomer = message.role === 'CUSTOMER';
     var bubble = document.createElement('div');
     bubble.className =
@@ -222,13 +274,14 @@
     if (!isCustomer && typeof message.confidence === 'number') {
       var meta = document.createElement('div');
       meta.className = 'meta';
-      meta.textContent = 'confidence ' + Math.round(message.confidence * 100) + '%';
+      meta.textContent = 'knowledge match ' + Math.round(message.confidence * 100) + '%';
       logEl.appendChild(meta);
     }
     scrollToEnd();
   }
 
   function renderTranscript(messages) {
+    state.messages = messages;
     logEl.textContent = '';
     if (!messages.length) {
       var empty = document.createElement('p');
@@ -272,12 +325,13 @@
       })
         .then(function (data) {
           renderTranscript(data.messages);
-          setStatus('Online · ' + (state.config ? state.config.tenantName : ''));
+          updateStatus(data.status);
         })
         .catch(function () {
           // Stored session expired or was revoked — start a fresh one.
           state.conversationId = null;
           state.visitorToken = null;
+          try { localStorage.removeItem(STORAGE_KEY); } catch (error) { /* private mode */ }
           return ensureSession();
         });
     }
@@ -289,42 +343,57 @@
       state.visitorToken = data.visitorToken;
       storeSession(state);
       renderTranscript([]);
-      setStatus('Online · ' + (state.config ? state.config.tenantName : ''));
+      updateStatus(data.conversation.status);
     });
   }
 
   function sendMessage(content) {
     if (state.pending || !content.trim()) return;
     state.pending = true;
+    state.error = null;
+    notify();
+    state.pollVersion += 1;
+    clearTimeout(state.pollTimer);
     submitEl.disabled = true;
     showTyping(true);
-    appendMessage({ role: 'CUSTOMER', content: content });
 
     ensureSession()
       .then(function () {
+        if (state.destroyed) return;
+        appendMessage({ role: 'CUSTOMER', content: content });
+        showTyping(true);
         return apiFetch(
           '/api/public/conversations/' + state.conversationId + '/messages',
           { method: 'POST', token: state.visitorToken, body: { content: content } },
         );
       })
-      .then(function () {
+      .then(function (data) {
+        if (state.destroyed || !data) return;
+        state.replyTo = data.message.id;
+        state.expectAI = data.generationQueued;
+        if (!state.expectAI) {
+          state.pending = false;
+          submitEl.disabled = false;
+          showTyping(false);
+        }
         pollForReply();
+        notify();
       })
       .catch(function (error) {
         showTyping(false);
         systemNote(error.message || 'Could not send your message. Please try again.');
-      })
-      .then(function () {
         state.pending = false;
         submitEl.disabled = false;
+        state.error = error.message || 'Could not send your message. Please try again.';
+        notify();
       });
   }
 
-  /** Reply generation is queued server-side, so poll the transcript briefly. */
+  /** Wait for an assistant/agent reply, not merely our own customer message. */
   function pollForReply() {
     state.pollAttempts = 0;
     clearTimeout(state.pollTimer);
-    var baseline = state.messages.length;
+    var version = ++state.pollVersion;
 
     function tick() {
       state.pollAttempts += 1;
@@ -332,36 +401,43 @@
         token: state.visitorToken,
       })
         .then(function (data) {
-          var incoming = data.messages.slice(baseline);
-          state.messages = data.messages;
-          if (incoming.length) {
-            showTyping(false);
+          if (version !== state.pollVersion) return;
+          var customerIndex = data.messages.findIndex(function (message) { return message.id === state.replyTo; });
+          var replied = customerIndex >= 0 && data.messages.slice(customerIndex + 1).some(function (message) {
+            return message.role === 'ASSISTANT' || message.role === 'AGENT';
+          });
+          var changed = JSON.stringify(data.messages) !== JSON.stringify(state.messages);
+          if (changed) {
             renderTranscript(data.messages);
+          }
+          updateStatus(data.status);
+          var waiting = state.expectAI && !replied && data.status === 'BOT';
+          showTyping(waiting && state.pollAttempts < POLL_MAX_ATTEMPTS);
+          if (!waiting || state.pollAttempts >= POLL_MAX_ATTEMPTS) {
             state.pending = false;
             submitEl.disabled = false;
-            if (data.status === 'HANDOFF' || data.status === 'HUMAN') {
-              systemNote('A human agent has joined this conversation.');
-              clearTimeout(state.pollTimer);
-            }
-            return;
           }
-          if (state.pollAttempts < POLL_MAX_ATTEMPTS) {
-            state.pollTimer = setTimeout(tick, POLL_INTERVAL_MS);
-          } else {
-            showTyping(false);
+          if (waiting && state.pollAttempts === POLL_MAX_ATTEMPTS) {
             systemNote('Still working on it — check back in a moment.');
-            state.pending = false;
-            submitEl.disabled = false;
           }
+          notify();
         })
         .catch(function () {
+          if (version !== state.pollVersion) return;
           showTyping(false);
           state.pending = false;
           submitEl.disabled = false;
+          notify();
+        })
+        .then(function () {
+          // Keep receiving human replies while the chat is open. Generation
+          // itself runs on the server and continues when this panel is closed.
+          if (version === state.pollVersion && state.open)
+            state.pollTimer = setTimeout(tick, POLL_INTERVAL_MS);
         });
     }
 
-    state.pollTimer = setTimeout(tick, POLL_INTERVAL_MS);
+    tick();
   }
 
   /* --------------------------------------------------------------- shell --- */
@@ -372,15 +448,24 @@
     launcher.setAttribute('aria-expanded', 'true');
     launcher.querySelector('.label').textContent = 'Close';
     inputEl.focus();
-    if (state.config) setStatus('Online · ' + state.config.tenantName);
-    ensureSession().catch(function (error) {
+    updateStatus();
+    // Inline demos do not create an empty inbox conversation on every visit.
+    if (inline && !state.conversationId && !loadStoredSession()) {
+      renderTranscript([]);
+      return;
+    }
+    ensureSession().then(function () { pollForReply(); }).catch(function (error) {
       setStatus('Unavailable');
       systemNote(error.message || 'Chat is unavailable right now.');
+      state.error = error.message || 'Chat is unavailable right now.';
+      notify();
     });
   }
 
   function close() {
     state.open = false;
+    state.pollVersion += 1;
+    clearTimeout(state.pollTimer);
     panel.hidden = true;
     launcher.setAttribute('aria-expanded', 'false');
     launcher.querySelector('.label').textContent = 'Chat';
@@ -398,23 +483,59 @@
     inputEl.value = '';
     sendMessage(content);
   });
-  document.addEventListener('keydown', function (event) {
-    if (event.key === 'Escape' && state.open) close();
-  });
+  function onKeydown(event) {
+    if (event.key === 'Escape' && state.open && !inline) close();
+  }
+
+  function onCommand(event) {
+    var detail = event.detail || {};
+    if (detail.widgetKey !== widgetKey || detail.mountId !== mountId) return;
+    if (detail.action === 'destroy') {
+      state.destroyed = true;
+      state.pollVersion += 1;
+      clearTimeout(state.pollTimer);
+      document.removeEventListener('keydown', onKeydown);
+      window.removeEventListener('csp:command', onCommand);
+      host.remove();
+      return;
+    }
+    if (state.pending || !state.config) return;
+    if (detail.action === 'reset') {
+      state.pollVersion += 1;
+      clearTimeout(state.pollTimer);
+      state.conversationId = null;
+      state.visitorToken = null;
+      state.replyTo = null;
+      state.expectAI = false;
+      state.error = null;
+      state.conversationStatus = 'BOT';
+      try { localStorage.removeItem(STORAGE_KEY); } catch (error) { /* private mode */ }
+      renderTranscript([]);
+    }
+    if (detail.action === 'compose' || detail.action === 'reset') {
+      open();
+      inputEl.value = detail.action === 'compose' && typeof detail.content === 'string' ? detail.content.slice(0, 8000) : '';
+      inputEl.focus();
+      notify();
+    }
+  }
+  document.addEventListener('keydown', onKeydown);
+  window.addEventListener('csp:command', onCommand);
 
   /* ---------------------------------------------------------------- boot --- */
 
-  document.body.appendChild(host);
+  (mount || document.body).appendChild(host);
   apiFetch('/api/public/widgets/' + encodeURIComponent(widgetKey))
     .then(function (config) {
+      if (state.destroyed) return;
       state.config = config;
-      setStatus('Online · ' + config.tenantName);
-      if (!config.autoReplyEnabled) {
-        setStatus('Agents online · ' + config.tenantName);
-      }
+      updateStatus();
+      if (inline) open();
     })
     .catch(function (error) {
       setStatus('Unavailable');
       systemNote(error.message || 'This chat widget is not configured.');
+      state.error = error.message || 'This chat widget is not configured.';
+      notify();
     });
 })();

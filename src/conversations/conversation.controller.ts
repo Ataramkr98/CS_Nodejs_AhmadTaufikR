@@ -25,6 +25,9 @@ const listSchema = paginationSchema.extend({
   channel: z.nativeEnum(ConversationChannel).optional(),
 });
 const messageSchema = z.object({ content: z.string().trim().min(1).max(8000) });
+const draftSchema = z.object({
+  previousDraft: z.string().trim().max(8000).optional(),
+});
 
 @Controller('api')
 @UseGuards(OperatorGuard)
@@ -64,6 +67,20 @@ export class ConversationController {
       id,
       request.user!.sub,
       parseInput(messageSchema, body).content,
+    );
+  }
+
+  @Post('conversations/:id/draft')
+  draftReply(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') id: string,
+    @Body() body: unknown = {},
+  ) {
+    requireRole(request.user!, UserRole.OWNER, UserRole.ADMIN, UserRole.AGENT);
+    return this.conversations.draftReply(
+      request.user!.tenantId,
+      id,
+      parseInput(draftSchema, body),
     );
   }
 

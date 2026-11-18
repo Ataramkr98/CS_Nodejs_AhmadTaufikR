@@ -42,6 +42,23 @@ export class OperatorGuard implements CanActivate {
   }
 }
 
+/** Session discovery may be anonymous; every console API still uses OperatorGuard. */
+@Injectable()
+export class OptionalOperatorGuard extends OperatorGuard {
+  constructor(tokens: TokenService) {
+    super(tokens);
+  }
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    try {
+      return await super.canActivate(context);
+    } catch (error) {
+      if (error instanceof UnauthorizedException) return true;
+      throw error;
+    }
+  }
+}
+
 @Injectable()
 export class VisitorGuard implements CanActivate {
   constructor(private readonly tokens: TokenService) {}

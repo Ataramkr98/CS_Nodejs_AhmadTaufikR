@@ -26,6 +26,7 @@ export interface ChatCompletionOptions {
   timeoutMs?: number;
   /** Outer abort signal (client disconnect, queue shutdown) merged with the timeout. */
   signal?: AbortSignal;
+  onUsage?: (usage: { promptTokens: number; completionTokens: number }) => void;
 }
 
 export interface ChatCompletionResult {
@@ -50,6 +51,9 @@ function buildBody(options: ChatCompletionOptions, stream: boolean): string {
   return JSON.stringify({
     model: options.model,
     stream,
+    ...(stream && options.onUsage
+      ? { stream_options: { include_usage: true } }
+      : {}),
     temperature: options.temperature ?? 0.2,
     ...(options.maxTokens ? { max_tokens: options.maxTokens } : {}),
     ...(options.responseFormat
@@ -111,8 +115,10 @@ export async function chatComplete(
     choices?: Array<{ message?: { content?: string } }>;
     usage?: { prompt_tokens?: number; completion_tokens?: number };
   };
+  const content = data.choices?.[0]?.message?.content ?? '';
+  assertReply(content);
   return {
-    content: data.choices?.[0]?.message?.content ?? '',
+    content,
     usage: data.usage
       ? {
           promptTokens: data.usage.prompt_tokens ?? 0,
@@ -145,28 +151,148 @@ export async function* chatStream(
       `AI provider returned ${response.status}`,
     );
   }
-  yield* parseSse(response.body);
+  try {
+    let prefix = '';
+    let started = false;
+    for await (const delta of responseText(response, options.onUsage)) {
+      if (!started) {
+        prefix += delta;
+        // The gateway sometimes sends a credential failure as HTTP 200 text.
+        // Hold that prefix until it can be checked, before leaking account
+        // details into a customer's transcript or accepting it as a reply.
+        const text = prefix.trimStart().toLowerCase();
+        const denied = 'your subscription has expired.';
+        if (!text || denied.startsWith(text) || text.startsWith(denied))
+          continue;
+        assertReply(prefix);
+        started = true;
+        yield prefix;
+      } else {
+        yield delta;
+      }
+    }
+    if (!started) {
+      assertReply(prefix);
+      yield prefix;
+    }
+  } catch (error) {
+    throw normalizeAiError(error);
+  }
+}
+
+function assertReply(content: string): void {
+  if (!content.trim()) {
+    throw new ServiceUnavailableException(
+      'AI provider returned an empty reply.',
+    );
+  }
+  if (
+    /^your subscription has expired\./i.test(content.trimStart()) &&
+    /API key status:\s*expired/i.test(content)
+  ) {
+    throw new ServiceUnavailableException(
+      'AI gateway subscription has expired. Renew its credential or configure another enabled provider.',
+    );
+  }
+}
+
+async function* responseText(
+  response: Response,
+  onUsage?: ChatCompletionOptions['onUsage'],
+): AsyncIterable<string> {
+  if (response.headers.get('content-type')?.includes('application/json')) {
+    const payload = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+      usage?: ProviderUsage;
+    };
+    reportUsage(payload.usage, onUsage);
+    yield payload.choices?.[0]?.message?.content ?? '';
+    return;
+  }
+  yield* parseSse(response.body!, onUsage);
+}
+
+interface ProviderUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+}
+
+function reportUsage(
+  usage: ProviderUsage | undefined,
+  onUsage?: ChatCompletionOptions['onUsage'],
+) {
+  if (
+    usage &&
+    Number.isInteger(usage.prompt_tokens) &&
+    Number.isInteger(usage.completion_tokens) &&
+    usage.prompt_tokens! >= 0 &&
+    usage.completion_tokens! >= 0
+  )
+    onUsage?.({
+      promptTokens: usage.prompt_tokens!,
+      completionTokens: usage.completion_tokens!,
+    });
 }
 
 export async function* parseSse(
   body: ReadableStream<Uint8Array>,
+  onUsage?: ChatCompletionOptions['onUsage'],
+): AsyncIterable<string> {
+  for await (const data of sseEvents(body)) {
+    if (data === '[DONE]') return;
+    if (!data.trim()) continue;
+    let payload: {
+      error?: unknown;
+      choices?: Array<{ delta?: { content?: string } }>;
+      usage?: ProviderUsage;
+      x_groq?: { usage?: ProviderUsage };
+    };
+    try {
+      payload = JSON.parse(data) as typeof payload;
+    } catch {
+      throw new ServiceUnavailableException(
+        'AI provider returned invalid stream data.',
+      );
+    }
+    if (payload.error) {
+      throw new ServiceUnavailableException(
+        'AI provider reported a generation error.',
+      );
+    }
+    reportUsage(payload.usage ?? payload.x_groq?.usage, onUsage);
+    const content = payload.choices?.[0]?.delta?.content;
+    if (typeof content === 'string' && content) yield content;
+  }
+}
+
+async function* sseEvents(
+  body: ReadableStream<Uint8Array>,
 ): AsyncIterable<string> {
   const decoder = new TextDecoder();
   let remainder = '';
+  let data: string[] = [];
   for await (const part of body) {
     remainder += decoder.decode(part, { stream: true });
-    const lines = remainder.split('\n');
-    remainder = lines.pop() ?? '';
-    for (const line of lines) {
-      if (!line.startsWith('data:')) continue;
-      const data = line.slice(5).trim();
-      if (data === '[DONE]') return;
-      const content = (
-        JSON.parse(data) as {
-          choices?: Array<{ delta?: { content?: string } }>;
-        }
-      ).choices?.[0]?.delta?.content;
-      if (content) yield content;
+    for (;;) {
+      const end = remainder.search(/[\r\n]/);
+      if (end < 0 || (remainder[end] === '\r' && end === remainder.length - 1))
+        break;
+      const line = remainder.slice(0, end);
+      const length =
+        remainder[end] === '\r' && remainder[end + 1] === '\n' ? 2 : 1;
+      remainder = remainder.slice(end + length);
+      if (line.startsWith('data:')) {
+        data.push(line.slice(5).replace(/^ /, ''));
+      } else if (line === '' && data.length) {
+        yield data.join('\n');
+        data = [];
+      }
     }
   }
+  remainder += decoder.decode();
+  // Some compatible gateways close without a final blank line.
+  const finalLine = remainder.replace(/\r$/, '');
+  if (finalLine.startsWith('data:'))
+    data.push(finalLine.slice(5).replace(/^ /, ''));
+  if (data.length) yield data.join('\n');
 }

@@ -16,6 +16,14 @@ export interface CapabilityDefinition {
 
 export const CAPABILITIES: readonly CapabilityDefinition[] = [
   {
+    id: 'auto-reply-24-7',
+    label: '24/7 AI auto-replies',
+    description:
+      'A selectable AI agent answers web-chat messages around the clock, with model fallbacks and human takeover.',
+    phase: 'mvp',
+    available: true,
+  },
+  {
     id: 'web-chat',
     label: 'Web chat widget',
     description:

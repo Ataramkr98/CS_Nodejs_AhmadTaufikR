@@ -86,6 +86,12 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
       customerMessageId?: string;
     },
   ): Promise<void> {
+    // A Function may freeze after its response. Finish work inside the request
+    // when running on Vercel instead of leaving an untracked microtask behind.
+    if (process.env.VERCEL) {
+      await this.run(name, data);
+      return;
+    }
     if (this.queue) {
       await this.queue.add(name, data, {
         attempts: 3,

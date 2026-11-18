@@ -85,6 +85,20 @@ export class KnowledgeController {
       throw new BadRequestException(
         `Upload exceeds the ${maxBytes} byte limit.`,
       );
+    const fields = file.fields as unknown as { title?: { value?: string } };
+    const title = fields.title?.value?.trim() || file.filename;
+    if (process.env.VERCEL) {
+      // Keep the extracted document in Postgres so reindexing works after
+      // instance changes, without depending on a Function's local filesystem.
+      return this.knowledge.createUpload(request.user!.tenantId, {
+        title,
+        type,
+        mimeType: file.mimetype,
+        filename: file.filename,
+        content: await this.knowledge.extractUpload(type, buffer),
+        byteSize: buffer.byteLength,
+      });
+    }
     const directory = join(
       this.config.get('UPLOAD_DIR', 'uploads'),
       request.user!.tenantId,
@@ -95,8 +109,6 @@ export class KnowledgeController {
       `${randomUUID()}${extname(file.filename).toLowerCase()}`,
     );
     await writeFile(storagePath, buffer, { flag: 'wx' });
-    const fields = file.fields as unknown as { title?: { value?: string } };
-    const title = fields.title?.value?.trim() || file.filename;
     return this.knowledge.createUpload(request.user!.tenantId, {
       title,
       type,

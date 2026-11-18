@@ -4,6 +4,7 @@
   "description": "",
   "author": "",
   "private": true,
+  "engines": { "node": "24.x" },
   "license": "UNLICENSED",
   "scripts": {
     "build": "nest build",

@@ -101,6 +101,7 @@ model TenantSettings {
   businessHours       String   @default("09:00-21:00")
   escalationThreshold Float    @default(0.65)
   autoReplyEnabled    Boolean  @default(true)
+  autoReplyModel      String?
   streamingEnabled    Boolean  @default(true)
   citationsEnabled    Boolean  @default(true)
   emailNotifications  Boolean  @default(true)

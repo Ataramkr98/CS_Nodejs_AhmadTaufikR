@@ -5,6 +5,7 @@ services:
     environment:
       DATABASE_URL: postgresql://csp_app:csp_app@postgres:5432/csp?schema=public
       MIGRATION_DATABASE_URL: postgresql://csp:csp@postgres:5432/csp?schema=public
+      DIRECT_URL: postgresql://csp:csp@postgres:5432/csp?schema=public
       REDIS_URL: redis://redis:6379
       QUEUE_ENABLED: "true"
       UPLOAD_DIR: /app/uploads

@@ -29,6 +29,7 @@ const settingsSchema = z
       .optional(),
     escalationThreshold: z.number().min(0).max(1).optional(),
     autoReplyEnabled: z.boolean().optional(),
+    autoReplyModel: z.string().trim().min(1).max(120).nullable().optional(),
     streamingEnabled: z.boolean().optional(),
     citationsEnabled: z.boolean().optional(),
     emailNotifications: z.boolean().optional(),

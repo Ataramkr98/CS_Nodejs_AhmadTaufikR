@@ -51,6 +51,31 @@ describe('API contract (e2e)', () => {
         expect(typeof response.body.detail).toBe('string');
       }));
 
+  it('discovers an anonymous session without a failed HTTP request', () =>
+    request(app.getHttpServer())
+      .get('/api/auth/me')
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.data).toEqual({
+          user: null,
+          tenant: null,
+          canRefresh: false,
+        });
+      }));
+
+  it('reports an expired access session as refreshable without authenticating it', () =>
+    request(app.getHttpServer())
+      .get('/api/auth/me')
+      .set('Cookie', 'csp_access=expired; csp_refresh=refresh-cookie')
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body.data).toEqual({
+          user: null,
+          tenant: null,
+          canRefresh: true,
+        });
+      }));
+
   it('serves the capability matrix without authentication', () =>
     request(app.getHttpServer())
       .get('/api/public/capabilities')
@@ -72,7 +97,32 @@ describe('API contract (e2e)', () => {
       .get('/widget.js')
       .expect(200)
       .expect('Content-Type', /javascript/)
+      .expect('Cross-Origin-Resource-Policy', 'cross-origin')
       .expect((response) => {
         expect(response.text).toContain('data-csp-key');
+      }));
+
+  it('allows a customer website to preflight the token-based widget API without cookies', () =>
+    request(app.getHttpServer())
+      .options('/api/public/widgets/test-key/sessions')
+      .set('Origin', 'https://customer-shop.example')
+      .set('Access-Control-Request-Method', 'POST')
+      .set('Access-Control-Request-Headers', 'content-type,authorization')
+      .expect(204)
+      .expect('Access-Control-Allow-Origin', 'https://customer-shop.example')
+      .expect(({ headers }) => {
+        expect(headers['access-control-allow-credentials']).toBeUndefined();
+        expect(headers['access-control-allow-headers']).toContain(
+          'authorization',
+        );
+      }));
+
+  it('does not allow customer websites to use the cookie-based operator API', () =>
+    request(app.getHttpServer())
+      .get('/api/auth/me')
+      .set('Origin', 'https://customer-shop.example')
+      .expect(200)
+      .expect(({ headers }) => {
+        expect(headers['access-control-allow-origin']).toBeUndefined();
       }));
 });

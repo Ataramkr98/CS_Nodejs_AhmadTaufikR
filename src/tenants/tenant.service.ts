@@ -1,4 +1,8 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { createHash, randomBytes } from 'crypto';
 import { PrismaService } from '../database/prisma.service';
 
@@ -20,6 +24,16 @@ export class TenantService {
   async updateProfile(tenantId: string, input: Record<string, unknown>) {
     const { name, allowedOrigins, ...settings } = input;
     return this.prisma.withTenant(tenantId, async (tx) => {
+      if (typeof settings.autoReplyModel === 'string') {
+        const model = await tx.tenantProviderConfig.findFirst({
+          where: { tenantId, model: settings.autoReplyModel, enabled: true },
+        });
+        if (!model) {
+          throw new BadRequestException(
+            'Enable this model in AI Models before selecting it for auto-replies.',
+          );
+        }
+      }
       if (typeof name === 'string')
         await tx.tenant.update({ where: { id: tenantId }, data: { name } });
       if (Array.isArray(allowedOrigins))

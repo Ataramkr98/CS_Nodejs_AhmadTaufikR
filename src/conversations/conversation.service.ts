@@ -1,4 +1,9 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ModuleRef } from '@nestjs/core';
 import {
   ConversationChannel,
@@ -9,7 +14,7 @@ import {
 import { ChatRequest } from '../common/contracts';
 import { PrismaService } from '../database/prisma.service';
 import { KnowledgeService } from '../knowledge/knowledge.service';
-import { ProviderService } from '../providers/provider.service';
+import { ProviderService, tokenUsage } from '../providers/provider.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 
 @Injectable()
@@ -106,16 +111,22 @@ export class ConversationService {
     const conversation = await this.get(tenantId, conversationId);
     return {
       status: conversation.status,
-      messages: conversation.messages.map((message) => ({
-        id: message.id,
-        role: message.role,
-        content: message.content,
-        createdAt: message.createdAt,
-        ...(message.role === MessageRole.ASSISTANT &&
-        message.confidence !== null
-          ? { confidence: message.confidence }
-          : {}),
-      })),
+      messages: conversation.messages
+        .filter(
+          (message) =>
+            message.status === MessageStatus.DELIVERED ||
+            message.status === MessageStatus.SENT,
+        )
+        .map((message) => ({
+          id: message.id,
+          role: message.role,
+          content: message.content,
+          createdAt: message.createdAt,
+          ...(message.role === MessageRole.ASSISTANT &&
+          message.confidence !== null
+            ? { confidence: message.confidence }
+            : {}),
+        })),
     };
   }
 
@@ -188,6 +199,79 @@ export class ConversationService {
     });
   }
 
+  /** Generate an operator suggestion without sending it or taking over the thread. */
+  async draftReply(
+    tenantId: string,
+    conversationId: string,
+    input: { previousDraft?: string } = {},
+  ) {
+    const conversation = await this.get(tenantId, conversationId);
+    const lastCustomer = conversation.messages.findLastIndex(
+      (message) =>
+        message.role === MessageRole.CUSTOMER && message.content.trim(),
+    );
+    if (lastCustomer < 0) {
+      throw new BadRequestException(
+        'There is no customer message to draft a reply to.',
+      );
+    }
+    const settings = await this.prisma.withTenant(tenantId, (tx) =>
+      tx.tenantSettings.findUniqueOrThrow({ where: { tenantId } }),
+    );
+    const context = await this.knowledge.search(
+      tenantId,
+      conversation.messages[lastCustomer].content,
+    );
+    const prompt: ChatRequest = {
+      tenantId,
+      language: settings.language,
+      mode: 'operator-draft',
+      brandVoice: settings.brandVoice,
+      previousDraft: input.previousDraft,
+      latestCustomerMessage: conversation.messages[lastCustomer].content,
+      context,
+      messages: conversation.messages
+        .filter(
+          (message) =>
+            message.content.trim() &&
+            message.status !== MessageStatus.FAILED &&
+            message.role !== MessageRole.SYSTEM,
+        )
+        .slice(-12)
+        .map((message) => ({
+          role:
+            message.role === MessageRole.ASSISTANT ||
+            message.role === MessageRole.AGENT
+              ? 'assistant'
+              : 'user',
+          content: message.content,
+        })),
+    };
+    const startedAt = Date.now();
+    const result = await this.providers.generate(prompt);
+    let content = '';
+    for await (const delta of result.stream) content += delta;
+    if (!content.trim()) {
+      throw new ServiceUnavailableException(
+        'The AI provider did not produce a reply. Try another provider.',
+      );
+    }
+    await this.prisma.withTenant(tenantId, (tx) =>
+      tx.llmUsage.create({
+        data: {
+          tenantId,
+          provider: result.provider,
+          model: result.model,
+          requestType: 'draft',
+          ...tokenUsage(result, prompt, content),
+          latencyMs: Date.now() - startedAt,
+          outcome: 'completed',
+        },
+      }),
+    );
+    return { content, provider: result.provider, model: result.model };
+  }
+
   async takeover(tenantId: string, conversationId: string, userId: string) {
     return this.setStatus(
       tenantId,
@@ -199,13 +283,34 @@ export class ConversationService {
   }
 
   async handoff(tenantId: string, conversationId: string, userId: string) {
-    return this.setStatus(
+    const updated = await this.setStatus(
       tenantId,
       conversationId,
-      ConversationStatus.HANDOFF,
-      'conversation.handed-off',
+      ConversationStatus.BOT,
+      'conversation.returned-to-bot',
       { userId },
     );
+    const settings = await this.prisma.withTenant(tenantId, (tx) =>
+      tx.tenantSettings.findUniqueOrThrow({ where: { tenantId } }),
+    );
+    if (settings.autoReplyEnabled) {
+      const conversation = await this.get(tenantId, conversationId);
+      const latest = conversation.messages.findLast(
+        (message) =>
+          (message.status === MessageStatus.DELIVERED ||
+            message.status === MessageStatus.SENT) &&
+          message.role !== MessageRole.SYSTEM,
+      );
+      if (latest?.role === MessageRole.CUSTOMER) {
+        await this.jobsService.enqueueReply(
+          tenantId,
+          conversationId,
+          latest.id,
+        );
+        return this.get(tenantId, conversationId);
+      }
+    }
+    return updated;
   }
 
   async resolve(tenantId: string, conversationId: string, userId: string) {
@@ -223,6 +328,10 @@ export class ConversationService {
     conversationId: string,
     customerMessageId: string,
   ): Promise<void> {
+    // The customer message is the durable idempotency key. Queue retries and
+    // concurrent instances can claim only one automatic reply for this turn.
+    const replyId = `auto-${customerMessageId}`;
+    let claimed = false;
     try {
       const conversation = await this.get(tenantId, conversationId);
       if (conversation.status !== ConversationStatus.BOT) return;
@@ -236,6 +345,65 @@ export class ConversationService {
         tx.tenantSettings.findUniqueOrThrow({ where: { tenantId } }),
       );
       if (!settings.autoReplyEnabled) return;
+      claimed = await this.prisma.withTenant(tenantId, async (tx) => {
+        // Lock this conversation briefly, without holding a transaction open
+        // during the provider call. A takeover or a newer turn wins at delivery.
+        const active = await tx.conversation.updateMany({
+          where: {
+            id: conversationId,
+            tenantId,
+            status: ConversationStatus.BOT,
+          },
+          data: { status: ConversationStatus.BOT },
+        });
+        if (!active.count) return false;
+        const latest = await tx.message.findFirst({
+          where: {
+            tenantId,
+            conversationId,
+            role: {
+              in: [
+                MessageRole.CUSTOMER,
+                MessageRole.AGENT,
+                MessageRole.ASSISTANT,
+              ],
+            },
+            status: { in: [MessageStatus.DELIVERED, MessageStatus.SENT] },
+          },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        });
+        if (latest?.id !== customerMessageId) return false;
+        await tx.message.deleteMany({
+          where: {
+            id: replyId,
+            tenantId,
+            OR: [
+              { status: MessageStatus.FAILED },
+              {
+                status: {
+                  in: [MessageStatus.PENDING, MessageStatus.STREAMING],
+                },
+                updatedAt: { lt: new Date(Date.now() - 5 * 60_000) },
+              },
+            ],
+          },
+        });
+        const created = await tx.message.createMany({
+          data: [
+            {
+              id: replyId,
+              tenantId,
+              conversationId,
+              role: MessageRole.ASSISTANT,
+              status: MessageStatus.PENDING,
+              content: '',
+            },
+          ],
+          skipDuplicates: true,
+        });
+        return created.count === 1;
+      });
+      if (!claimed) return;
       const hits = await this.knowledge.search(
         tenantId,
         customerMessage.content,
@@ -243,115 +411,137 @@ export class ConversationService {
       const prompt: ChatRequest = {
         tenantId,
         language: settings.language,
+        preferredModel: settings.autoReplyModel,
+        brandVoice: settings.brandVoice,
         context: hits,
-        messages: conversation.messages.slice(-12).map((message) => ({
-          role:
-            message.role === MessageRole.ASSISTANT
-              ? 'assistant'
-              : message.role === MessageRole.SYSTEM
-                ? 'system'
+        messages: conversation.messages
+          .filter(
+            (message) =>
+              message.content.trim() &&
+              (message.status === MessageStatus.DELIVERED ||
+                message.status === MessageStatus.SENT) &&
+              message.role !== MessageRole.SYSTEM,
+          )
+          .slice(-12)
+          .map((message) => ({
+            role:
+              message.role === MessageRole.ASSISTANT ||
+              message.role === MessageRole.AGENT
+                ? 'assistant'
                 : 'user',
-          content: message.content,
-        })),
+            content: message.content,
+          })),
       };
       const startedAt = Date.now();
       const result = await this.providers.generate(prompt);
       const assistant = await this.prisma.withTenant(tenantId, (tx) =>
-        tx.message.create({
+        tx.message.update({
+          where: { id: replyId },
           data: {
-            tenantId,
-            conversationId,
-            role: MessageRole.ASSISTANT,
             status: MessageStatus.STREAMING,
-            content: '',
             provider: result.provider,
             model: result.model,
             confidence: hits[0]?.score ?? 0,
           },
         }),
       );
-      this.realtime.emitConversation(
-        tenantId,
+      this.realtime.emitTenant(tenantId, 'assistant.stream.started', {
         conversationId,
-        'assistant.stream.started',
-        {
-          conversationId,
-          messageId: assistant.id,
-          provider: result.provider,
-          model: result.model,
-          citations: hits.map(({ chunkId, sourceId, sourceTitle, score }) => ({
-            chunkId,
-            sourceId,
-            sourceTitle,
-            score,
-          })),
-        },
-      );
+        messageId: assistant.id,
+        provider: result.provider,
+        model: result.model,
+        citations: hits.map(({ chunkId, sourceId, sourceTitle, score }) => ({
+          chunkId,
+          sourceId,
+          sourceTitle,
+          score,
+        })),
+      });
       let content = '';
-      // Failures mid-stream are handled here rather than by the outer catch: the
-      // placeholder assistant message already exists at that point, so it has to
-      // be finalised or the transcript would keep an empty STREAMING bubble.
-      try {
-        for await (const delta of result.stream) {
-          content += delta;
-          this.realtime.emitConversation(
-            tenantId,
-            conversationId,
-            'assistant.stream.delta',
-            { conversationId, messageId: assistant.id, delta },
-          );
-        }
-      } catch (streamError) {
-        await this.prisma.withTenant(tenantId, (tx) =>
-          tx.message.update({
-            where: { id: assistant.id },
-            data: {
-              content:
-                content ||
-                'The assistant could not complete this reply. A teammate will follow up.',
-              status: MessageStatus.FAILED,
-              latencyMs: Date.now() - startedAt,
-            },
-          }),
-        );
-        this.realtime.emitConversation(
-          tenantId,
-          conversationId,
-          'assistant.stream.failed',
-          {
+      for await (const delta of result.stream) {
+        content += delta;
+        // Operators may preview the stream. Visitors receive only the
+        // committed reply, after a final check for takeover or a paused agent.
+        if (settings.streamingEnabled)
+          this.realtime.emitTenant(tenantId, 'assistant.stream.delta', {
             conversationId,
             messageId: assistant.id,
-            detail:
-              streamError instanceof Error ? streamError.message : 'unknown',
-          },
+            delta,
+          });
+      }
+      if (!content.trim()) {
+        throw new ServiceUnavailableException(
+          'The AI provider returned an empty reply.',
         );
-        await this.prisma.withTenant(tenantId, (tx) =>
-          tx.conversation.update({
-            where: { id: conversationId },
-            data: { status: ConversationStatus.FAILED },
-          }),
-        );
-        return;
       }
       const confidence = hits[0]?.score ?? 0;
       const shouldEscalate =
         confidence < settings.escalationThreshold ||
         /belum menemukan informasi|tidak cukup/i.test(content);
-      await this.prisma.withTenant(tenantId, async (tx) => {
+      const delivered = await this.prisma.withTenant(tenantId, async (tx) => {
+        const active = await tx.conversation.updateMany({
+          where: {
+            id: conversationId,
+            tenantId,
+            status: ConversationStatus.BOT,
+          },
+          data: { status: ConversationStatus.BOT },
+        });
+        const currentSettings = await tx.tenantSettings.findUniqueOrThrow({
+          where: { tenantId },
+        });
+        const latest = await tx.message.findFirst({
+          where: {
+            tenantId,
+            conversationId,
+            role: {
+              in: [
+                MessageRole.CUSTOMER,
+                MessageRole.AGENT,
+                MessageRole.ASSISTANT,
+              ],
+            },
+            status: { in: [MessageStatus.DELIVERED, MessageStatus.SENT] },
+          },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        });
+        const canDeliver =
+          active.count > 0 &&
+          currentSettings.autoReplyEnabled &&
+          latest?.id === customerMessageId;
+        await tx.llmUsage.create({
+          data: {
+            tenantId,
+            provider: result.provider,
+            model: result.model,
+            requestType: 'chat',
+            ...tokenUsage(result, prompt, content),
+            latencyMs: Date.now() - startedAt,
+            outcome: canDeliver
+              ? shouldEscalate
+                ? 'escalated'
+                : 'completed'
+              : 'cancelled',
+          },
+        });
+        if (!canDeliver) {
+          await tx.message.update({
+            where: { id: replyId },
+            data: { status: MessageStatus.FAILED, content: '' },
+          });
+          return false;
+        }
         await tx.message.update({
           where: { id: assistant.id },
           data: {
             content,
             status: MessageStatus.DELIVERED,
             confidence,
-            tokensIn: estimateTokens(
-              prompt.messages.map((message) => message.content).join(' '),
-            ),
-            tokensOut: estimateTokens(content),
+            ...tokenUsage(result, prompt, content),
             latencyMs: Date.now() - startedAt,
           },
         });
-        if (hits.length)
+        if (hits.length && currentSettings.citationsEnabled)
           await tx.messageCitation.createMany({
             data: hits.map((hit) => ({
               messageId: assistant.id,
@@ -360,20 +550,6 @@ export class ConversationService {
               score: hit.score,
             })),
           });
-        await tx.llmUsage.create({
-          data: {
-            tenantId,
-            provider: result.provider,
-            model: result.model,
-            requestType: 'chat',
-            tokensIn: estimateTokens(
-              prompt.messages.map((message) => message.content).join(' '),
-            ),
-            tokensOut: estimateTokens(content),
-            latencyMs: Date.now() - startedAt,
-            outcome: shouldEscalate ? 'escalated' : 'completed',
-          },
-        });
         await tx.conversation.update({
           where: { id: conversationId },
           data: {
@@ -389,7 +565,15 @@ export class ConversationService {
               data: { confidence, threshold: settings.escalationThreshold },
             },
           });
+        return true;
       });
+      if (!delivered) {
+        this.realtime.emitTenant(tenantId, 'assistant.stream.cancelled', {
+          conversationId,
+          messageId: replyId,
+        });
+        return;
+      }
       this.realtime.emitConversation(
         tenantId,
         conversationId,
@@ -404,22 +588,30 @@ export class ConversationService {
           { conversationId, confidence, status: ConversationStatus.HANDOFF },
         );
     } catch (error) {
+      if (!claimed) throw error;
       const detail =
         error instanceof Error
           ? error.message
           : 'Unknown AI generation failure.';
-      await this.prisma.withTenant(tenantId, (tx) =>
-        tx.conversation.update({
-          where: { id: conversationId },
+      await this.prisma.withTenant(tenantId, async (tx) => {
+        await tx.message.update({
+          where: { id: replyId },
+          data: { status: MessageStatus.FAILED, content: '' },
+        });
+        await tx.conversation.updateMany({
+          where: {
+            id: conversationId,
+            tenantId,
+            status: ConversationStatus.BOT,
+          },
           data: { status: ConversationStatus.FAILED },
-        }),
-      );
-      this.realtime.emitConversation(
-        tenantId,
+        });
+      });
+      this.realtime.emitTenant(tenantId, 'assistant.stream.failed', {
         conversationId,
-        'assistant.stream.failed',
-        { conversationId, detail },
-      );
+        messageId: replyId,
+        detail,
+      });
     }
   }
 
@@ -434,35 +626,59 @@ export class ConversationService {
     },
   ) {
     await this.get(tenantId, conversationId);
-    const message = await this.prisma.withTenant(tenantId, async (tx) => {
-      const created = await tx.message.create({
-        data: {
-          tenantId,
-          conversationId,
-          role: input.role,
-          content: input.content,
-          authorUserId: input.authorUserId,
-          status: MessageStatus.DELIVERED,
-        },
-      });
-      await tx.conversation.update({
-        where: { id: conversationId },
-        data: {
-          lastMessageAt: new Date(),
-          ...(input.forceHuman ? { status: ConversationStatus.HUMAN } : {}),
-        },
-      });
-      return created;
-    });
+    const { message, status } = await this.prisma.withTenant(
+      tenantId,
+      async (tx) => {
+        const created = await tx.message.create({
+          data: {
+            tenantId,
+            conversationId,
+            role: input.role,
+            content: input.content,
+            authorUserId: input.authorUserId,
+            status: MessageStatus.DELIVERED,
+          },
+        });
+        const updated = await tx.conversation.update({
+          where: { id: conversationId },
+          data: {
+            lastMessageAt: new Date(),
+            ...(input.forceHuman ? { status: ConversationStatus.HUMAN } : {}),
+          },
+        });
+        const reopen =
+          input.role === MessageRole.CUSTOMER &&
+          updated.status === ConversationStatus.RESOLVED;
+        if (reopen)
+          await tx.conversation.update({
+            where: { id: conversationId },
+            data: { status: ConversationStatus.BOT },
+          });
+        return {
+          message: created,
+          status: reopen ? ConversationStatus.BOT : updated.status,
+        };
+      },
+    );
     this.realtime.emitConversation(
       tenantId,
       conversationId,
       'conversation.message.created',
       { conversationId, message },
     );
-    if (input.role === MessageRole.CUSTOMER)
+    const settings =
+      input.role === MessageRole.CUSTOMER
+        ? await this.prisma.withTenant(tenantId, (tx) =>
+            tx.tenantSettings.findUniqueOrThrow({ where: { tenantId } }),
+          )
+        : null;
+    const generationQueued =
+      input.role === MessageRole.CUSTOMER &&
+      Boolean(settings?.autoReplyEnabled) &&
+      status === ConversationStatus.BOT;
+    if (generationQueued)
       await this.jobsService.enqueueReply(tenantId, conversationId, message.id);
-    return { message, generationQueued: input.role === MessageRole.CUSTOMER };
+    return { message, generationQueued };
   }
 
   private async setStatus(
@@ -501,8 +717,4 @@ export class ConversationService {
   } {
     return this.moduleRef.get('JobsService', { strict: false });
   }
-}
-
-function estimateTokens(value: string): number {
-  return Math.max(1, Math.ceil(value.length / 4));
 }

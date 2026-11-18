@@ -44,7 +44,7 @@ export class PublicConversationController {
     const settings = await this.prisma.withTenant(tenant.id, (tx) =>
       tx.tenantSettings.findUnique({ where: { tenantId: tenant.id } }),
     );
-    const origin = request.headers.origin;
+    const origin = widgetOrigin(request);
     if (
       tenant.allowedOrigins.length &&
       (!origin || !tenant.allowedOrigins.includes(origin))
@@ -58,6 +58,7 @@ export class PublicConversationController {
       language: settings?.language ?? 'id',
       businessHours: settings?.businessHours,
       autoReplyEnabled: settings?.autoReplyEnabled ?? false,
+      aiAvailability: settings?.autoReplyEnabled ? '24/7' : 'paused',
     };
   }
 
@@ -71,7 +72,7 @@ export class PublicConversationController {
       tx.tenant.findUnique({ where: { widgetKey } }),
     );
     if (!tenant) throw new NotFoundException('Widget not found.');
-    const origin = request.headers.origin;
+    const origin = widgetOrigin(request);
     if (
       tenant.allowedOrigins.length &&
       (!origin || !tenant.allowedOrigins.includes(origin))
@@ -128,4 +129,12 @@ export class PublicConversationController {
       );
     }
   }
+}
+
+function widgetOrigin(request: AuthenticatedRequest): string | undefined {
+  // Browsers omit Origin on same-origin GETs. The widget supplies its page
+  // origin explicitly in that case; a browser's real Origin always wins.
+  const origin =
+    request.headers.origin ?? request.headers['x-csp-widget-origin'];
+  return typeof origin === 'string' ? origin : undefined;
 }

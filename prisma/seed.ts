@@ -10,8 +10,17 @@ import {
   UserRole,
 } from '@prisma/client';
 import * as argon2 from 'argon2';
+import { existsSync } from 'node:fs';
 
-const prisma = new PrismaClient();
+if (existsSync('.env')) process.loadEnvFile('.env');
+
+// Seed setup is privileged; normal API queries use the tenant-scoped app role.
+const prisma = new PrismaClient({
+  datasourceUrl:
+    process.env.DIRECT_URL ??
+    process.env.MIGRATION_DATABASE_URL ??
+    process.env.DATABASE_URL,
+});
 
 const DEMO_WIDGET_KEY = 'demo-widget-key';
 const DEMO_EMAIL = 'demo@cspintar.io';
@@ -135,6 +144,18 @@ async function main() {
   /* ---------------------------------------------------------- providers --- */
 
   const providerDefaults = [
+    {
+      provider: ProviderKind.GROQ,
+      model: 'openai/gpt-oss-20b',
+      enabled: true,
+      priority: 5,
+    },
+    {
+      provider: ProviderKind.DEMO,
+      model: 'csp-demo-v1',
+      enabled: true,
+      priority: 100,
+    },
     {
       provider: ProviderKind.AUTOAPP,
       model: 'minimax-m3',

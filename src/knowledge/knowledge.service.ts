@@ -1,5 +1,6 @@
 import {
   Injectable,
+  Logger,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -13,6 +14,7 @@ import { RealtimeGateway } from '../realtime/realtime.gateway';
 
 @Injectable()
 export class KnowledgeService {
+  private readonly logger = new Logger(KnowledgeService.name);
   constructor(
     private readonly prisma: PrismaService,
     private readonly providers: ProviderService,
@@ -90,7 +92,8 @@ export class KnowledgeService {
       type: SourceType;
       mimeType: string;
       filename: string;
-      storagePath: string;
+      storagePath?: string;
+      content?: string;
       byteSize: number;
     },
   ) {
@@ -103,6 +106,7 @@ export class KnowledgeService {
           mimeType: input.mimeType,
           filename: input.filename,
           storagePath: input.storagePath,
+          content: input.content,
           byteSize: input.byteSize,
         },
       }),
@@ -258,19 +262,81 @@ export class KnowledgeService {
     query: string,
     limit = 4,
   ): Promise<RetrievalHit[]> {
-    const embedding = await this.providers.embed(query);
-    const vector = `[${embedding.join(',')}]`;
-    return this.prisma.withTenant(tenantId, (tx) =>
-      tx.$queryRaw<RetrievalHit[]>(Prisma.sql`
+    if (limit <= 0) return [];
+    let semantic: RetrievalHit[] = [];
+    try {
+      const embedding = await this.providers.embed(query);
+      const vector = `[${embedding.join(',')}]`;
+      semantic = await this.prisma.withTenant(tenantId, (tx) =>
+        tx.$queryRaw<RetrievalHit[]>(Prisma.sql`
         SELECT c.id AS "chunkId", c."sourceId" AS "sourceId", s.title AS "sourceTitle", c.content AS content,
           (1 - (c.embedding <=> ${vector}::vector))::float AS score
         FROM "KnowledgeChunk" c
         INNER JOIN "KnowledgeSource" s ON s.id = c."sourceId"
-        WHERE c."tenantId" = ${tenantId} AND c.embedding IS NOT NULL AND s.status = 'READY'
+        WHERE c."tenantId" = ${tenantId} AND s."tenantId" = ${tenantId}
+          AND c.embedding IS NOT NULL AND s.status = 'READY'
         ORDER BY c.embedding <=> ${vector}::vector
         LIMIT ${limit}
       `),
+      );
+    } catch {
+      this.logger.warn('Semantic retrieval unavailable; using text matching.');
+    }
+    // READY text sources can exist without vectors, including seeded sources.
+    // They must still be available to drafting when embeddings are absent.
+    const terms = knowledgeSearchTerms(query);
+    if (!terms.length) return semantic;
+    const matches = terms.map(
+      (term) => Prisma.sql`(
+      CASE WHEN c.content ILIKE ${'%' + term + '%'} THEN 1 ELSE 0 END +
+      CASE WHEN s.title ILIKE ${'%' + term + '%'} THEN 2 ELSE 0 END
+    )`,
     );
+    const rank = Prisma.sql`(${Prisma.join(matches, ' + ')})`;
+    const lexical = await this.prisma.withTenant(tenantId, (tx) =>
+      tx.$queryRaw<Array<Omit<RetrievalHit, 'score'>>>(Prisma.sql`
+        SELECT c.id AS "chunkId", c."sourceId" AS "sourceId", s.title AS "sourceTitle",
+          c.content AS content
+        FROM "KnowledgeChunk" c
+        INNER JOIN "KnowledgeSource" s ON s.id = c."sourceId"
+        WHERE c."tenantId" = ${tenantId} AND s."tenantId" = ${tenantId}
+          AND s.status = 'READY' AND ${rank} > 0
+        ORDER BY ${rank} DESC, c.ordinal ASC, c.id ASC
+        LIMIT ${limit}
+      `),
+    );
+    // Lexical relevance measures covered query concepts, not vector similarity
+    // or a model's probability of being correct. Aliases count once, so adding
+    // a translation cannot inflate the denominator or the score.
+    const merged = new Map(semantic.map((hit) => [hit.chunkId, hit]));
+    for (const hit of lexical) {
+      const score = lexicalRelevance(
+        query,
+        hit.sourceTitle + ' ' + hit.content,
+      );
+      if (score > (merged.get(hit.chunkId)?.score ?? 0)) {
+        merged.set(hit.chunkId, { ...hit, score });
+      }
+    }
+    return [...merged.values()]
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
+  }
+
+  async extractUpload(type: SourceType, buffer: Buffer): Promise<string> {
+    if (type === SourceType.MARKDOWN || type === SourceType.TEXT)
+      return normalize(buffer.toString('utf8'));
+    if (type === SourceType.DOCX) {
+      const mammoth = await import('mammoth');
+      return normalize((await mammoth.extractRawText({ buffer })).value);
+    }
+    if (type === SourceType.PDF) {
+      const parser = (await import('pdf-parse')).default as (
+        input: Buffer,
+      ) => Promise<{ text: string }>;
+      return normalize((await parser(buffer)).text);
+    }
+    throw new ServiceUnavailableException('This source type is not supported.');
   }
 
   private async extractContent(source: {
@@ -278,7 +344,8 @@ export class KnowledgeService {
     content: string | null;
     storagePath: string | null;
   }): Promise<string> {
-    if (source.type === SourceType.TEXT) return normalize(source.content ?? '');
+    if (source.type === SourceType.TEXT || source.content !== null)
+      return normalize(source.content ?? '');
     if (!source.storagePath)
       throw new ServiceUnavailableException(
         'The uploaded source is missing its secure storage path.',
@@ -307,6 +374,104 @@ export class KnowledgeService {
   } {
     return this.moduleRef.get('JobsService', { strict: false });
   }
+}
+
+const SEARCH_STOP_WORDS = new Set([
+  'apa',
+  'apakah',
+  'bisa',
+  'boleh',
+  'bagaimana',
+  'berapa',
+  'dengan',
+  'dari',
+  'dan',
+  'yang',
+  'untuk',
+  'saya',
+  'anda',
+  'ingin',
+  'mau',
+  'ada',
+  'itu',
+  'ini',
+  'the',
+  'and',
+  'can',
+  'you',
+  'how',
+  'what',
+  'with',
+  'for',
+  'please',
+  'which',
+  'are',
+  'is',
+  'your',
+  'our',
+  'does',
+  'use',
+  'available',
+  'about',
+  'have',
+  'accept',
+  'accepted',
+]);
+
+const SEARCH_ALIASES: Record<string, string> = {
+  kirim: 'pengiriman',
+  kirimkan: 'pengiriman',
+  dikirim: 'pengiriman',
+  mengirim: 'pengiriman',
+  shipping: 'pengiriman',
+  ship: 'pengiriman',
+  delivery: 'pengiriman',
+  carrier: 'kurir',
+  carriers: 'kurir',
+  courier: 'kurir',
+  couriers: 'kurir',
+  pay: 'pembayaran',
+  payment: 'pembayaran',
+  payments: 'pembayaran',
+  bayar: 'pembayaran',
+  return: 'retur',
+  returns: 'retur',
+  policy: 'kebijakan',
+  tukar: 'penukaran',
+  menukar: 'penukaran',
+  exchange: 'penukaran',
+  exchanges: 'penukaran',
+};
+
+function queryTerms(query: string): string[] {
+  return (query.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter(
+    (term) => term.length >= 3 && !SEARCH_STOP_WORDS.has(term),
+  );
+}
+
+/** Fraction of distinct query concepts found in the retrieved source. */
+export function lexicalRelevance(query: string, text: string): number {
+  const concepts = new Set(
+    queryTerms(query).map((term) => SEARCH_ALIASES[term] ?? term),
+  );
+  if (!concepts.size) return 0;
+  const found = new Set(
+    (text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).map(
+      (term) => SEARCH_ALIASES[term] ?? term,
+    ),
+  );
+  return [...concepts].filter((term) => found.has(term)).length / concepts.size;
+}
+
+function knowledgeSearchTerms(query: string): string[] {
+  const terms = queryTerms(query);
+  return [
+    ...new Set(
+      terms.flatMap((term) =>
+        SEARCH_ALIASES[term] ? [term, SEARCH_ALIASES[term]] : [term],
+      ),
+    ),
+  ].slice(0, 12);
 }
 
 function normalize(value: string): string {
